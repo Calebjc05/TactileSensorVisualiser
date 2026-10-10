@@ -14,6 +14,7 @@ APP_TITLE = "Tactile Visualiser"
 MAX_ROWS = 32
 MAX_COLS = 32
 SIM_MAX_FORCE_N = 40.0
+MAX_VOLTAGE_V = 2.6
 SATURATION_FORCE_N = 40.0
 
 ctk.set_appearance_mode("light")
@@ -35,15 +36,15 @@ class TactileVisualiserApp(ctk.CTk):
         self.cols = 16
 
         # Keep simulated and live sensor data completely separate.
-        # Simulation values are stored directly in newtons.
-        self.sim_force_matrix = np.zeros((self.rows, self.cols), dtype=float)
+        # Simulation force values are stored in newtons; voltage is derived on a 0–2.6 V scale.
+        self.sim_force_matrix = np.zeros((self.rows, self.cols), dtype=float)  # signed local simulation inputs
+        self.sim_display_force_matrix = np.zeros((self.rows, self.cols), dtype=float)  # spread/combined force field
         self.live_force_matrix = np.zeros((self.rows, self.cols), dtype=float)
 
         self.data_source = tk.StringVar(value="Simulation")
         self.live_sensor_connected = False
 
-        self.raw_matrix = np.zeros((self.rows, self.cols), dtype=float)
-        self.normalised_matrix = np.zeros((self.rows, self.cols), dtype=float)
+        self.voltage_matrix = np.zeros((self.rows, self.cols), dtype=float)
         self.baseline = np.zeros((self.rows, self.cols), dtype=float)
         self.baseline_captured = False
 
@@ -52,7 +53,7 @@ class TactileVisualiserApp(ctk.CTk):
         self.hover_row = None
         self.hover_col = None
 
-        self.display_mode = tk.StringVar(value="normalised")
+        self.display_mode = tk.StringVar(value="voltage")
         self.mode_text = tk.StringVar(value="Simulation")
         self.connection_text = tk.StringVar(value="No hardware")
         self.fps_text = tk.StringVar(value="0.0 FPS")
@@ -317,10 +318,10 @@ class TactileVisualiserApp(ctk.CTk):
 
         display_menu = ctk.CTkSegmentedButton(
             title_row,
-            values=["Normalised", "Raw"],
+            values=["Voltage", "Force"],
             command=self._change_display_mode
         )
-        display_menu.set("Normalised" if self.display_mode.get() == "normalised" else "Raw")
+        display_menu.set("Voltage" if self.display_mode.get() == "voltage" else "Force")
         display_menu.grid(row=0, column=3, padx=(0, 0))
 
         self.heatmap_canvas = tk.Canvas(
@@ -348,7 +349,7 @@ class TactileVisualiserApp(ctk.CTk):
 
         ctk.CTkLabel(
             footer,
-            text="Simulation: hover + scroll = force (N)   •   Click = select   •   Right-click = clear",
+            text="Simulation: hover + scroll = input level   •   Click = select   •   Right-click = clear",
             text_color=self._palette()["muted"],
             font=ctk.CTkFont(size=12)
         ).grid(row=0, column=0, sticky="w")
@@ -450,14 +451,12 @@ class TactileVisualiserApp(ctk.CTk):
         ).pack(anchor="w", padx=16, pady=(14, 8))
 
         self.sel_position = tk.StringVar(value="Row 8, Column 8")
+        self.sel_voltage = tk.StringVar(value="0.000 V")
         self.sel_force = tk.StringVar(value="0.0 N")
-        self.sel_raw = tk.StringVar(value="0.0")
-        self.sel_norm = tk.StringVar(value="0.000")
 
         self._card_row(card, "Position", self.sel_position)
-        self._card_row(card, "Force", self.sel_force, highlight=True)
-        self._card_row(card, "Raw value", self.sel_raw)
-        self._card_row(card, "Normalised", self.sel_norm)
+        self._card_row(card, "Voltage", self.sel_voltage, highlight=True)
+        self._card_row(card, "Force", self.sel_force)
 
         ctk.CTkLabel(
             card,
@@ -582,7 +581,7 @@ class TactileVisualiserApp(ctk.CTk):
 
         ctk.CTkLabel(
             page,
-            text="Capture a baseline and switch between raw and normalised values.",
+            text="Capture a voltage baseline for zero-offset correction.",
             text_color=self._palette()["muted"]
         ).pack(anchor="w", pady=(4, 16))
 
@@ -997,9 +996,9 @@ class TactileVisualiserApp(ctk.CTk):
         self.cols = cols
 
         self.sim_force_matrix = np.zeros((rows, cols), dtype=float)
+        self.sim_display_force_matrix = np.zeros((rows, cols), dtype=float)
         self.live_force_matrix = np.zeros((rows, cols), dtype=float)
-        self.raw_matrix = np.zeros((rows, cols), dtype=float)
-        self.normalised_matrix = np.zeros((rows, cols), dtype=float)
+        self.voltage_matrix = np.zeros((rows, cols), dtype=float)
         self.baseline = np.zeros((rows, cols), dtype=float)
 
         self.selected_row = min(self.selected_row, rows - 1)
@@ -1066,7 +1065,7 @@ class TactileVisualiserApp(ctk.CTk):
         self._draw_heatmap()
 
     def _change_display_mode(self, value):
-        self.display_mode.set("normalised" if value == "Normalised" else "raw")
+        self.display_mode.set("voltage" if value == "Voltage" else "force")
         self._draw_heatmap()
 
     def _event_to_cell(self, event):
@@ -1106,9 +1105,14 @@ class TactileVisualiserApp(ctk.CTk):
             self.hover_value_text.set("Hover: —")
         else:
             active_force = self._active_force_matrix()
-            self.hover_value_text.set(
-                f"Hover: R{row+1}, C{col+1}  |  Force {active_force[row, col]:.1f} N"
-            )
+            if self.display_mode.get() == "voltage":
+                self.hover_value_text.set(
+                    f"Hover: R{row+1}, C{col+1}  |  Voltage {self.voltage_matrix[row, col]:.3f} V"
+                )
+            else:
+                self.hover_value_text.set(
+                    f"Hover: R{row+1}, C{col+1}  |  Force {active_force[row, col]:.1f} N"
+                )
         self._draw_heatmap()
 
     def _on_heatmap_leave(self, _event):
@@ -1132,6 +1136,8 @@ class TactileVisualiserApp(ctk.CTk):
         if row is None or self.is_playing or self.data_source.get() != "Simulation":
             return
         self.sim_force_matrix[row, col] = 0.0
+        self.sim_display_force_matrix = self._generate_simulated_force_matrix()
+        self.voltage_matrix = self._generate_voltage_matrix()
 
     def _on_heatmap_middle_click(self, event):
         self._on_heatmap_right_click(event)
@@ -1159,31 +1165,67 @@ class TactileVisualiserApp(ctk.CTk):
             return
 
         r, c = self.hover_row, self.hover_col
+        current_input = float(self.sim_force_matrix[r, c])
+
+        if delta < 0 and current_input <= 0.0:
+            # This taxel is only showing force/voltage because of a neighbouring
+            # epicentre. It is display-only, so do not let the user subtract from it.
+            if self.display_mode.get() == "voltage":
+                self.hover_value_text.set(
+                    f"Hover: R{r+1}, C{c+1}  |  Voltage {self.voltage_matrix[r, c]:.3f} V  |  No local input"
+                )
+            else:
+                self.hover_value_text.set(
+                    f"Hover: R{r+1}, C{c+1}  |  Force {self.sim_display_force_matrix[r, c]:.1f} N  |  No local input"
+                )
+            return
+
+        # Positive scrolling can create a new epicentre on any taxel.
+        # Negative scrolling can only reduce an existing epicentre.
         self.sim_force_matrix[r, c] = np.clip(
-            self.sim_force_matrix[r, c] + delta,
+            current_input + delta,
             0.0,
             SIM_MAX_FORCE_N
         )
 
+        self.sim_display_force_matrix = self._generate_simulated_force_matrix()
+        self.voltage_matrix = self._generate_voltage_matrix()
+
+        if self.baseline_captured:
+            self.voltage_matrix = np.clip(
+                self.voltage_matrix - self.baseline,
+                0.0,
+                MAX_VOLTAGE_V
+            )
+
         if r == self.selected_row and c == self.selected_col:
             self._update_selected_taxel_info()
 
-        self.hover_value_text.set(
-            f"Hover: R{r+1}, C{c+1}  |  Force {self.sim_force_matrix[r, c]:.1f} N"
-        )
+        if self.display_mode.get() == "voltage":
+            self.hover_value_text.set(
+                f"Hover: R{r+1}, C{c+1}  |  Voltage {self.voltage_matrix[r, c]:.3f} V"
+            )
+        else:
+            self.hover_value_text.set(
+                f"Hover: R{r+1}, C{c+1}  |  Force {self.sim_display_force_matrix[r, c]:.1f} N"
+            )
 
     def _clear_selected_taxel(self):
         if not self.is_playing and self.data_source.get() == "Simulation":
             self.sim_force_matrix[self.selected_row, self.selected_col] = 0.0
+            self.sim_display_force_matrix = self._generate_simulated_force_matrix()
+            self.voltage_matrix = self._generate_voltage_matrix()
 
     def _clear_all_force(self):
         if not self.is_playing and self.data_source.get() == "Simulation":
             self.sim_force_matrix.fill(0.0)
+            self.sim_display_force_matrix.fill(0.0)
+            self.voltage_matrix.fill(0.0)
 
     def _active_force_matrix(self):
         if self.data_source.get() == "Live Sensor":
             return self.live_force_matrix
-        return self.sim_force_matrix
+        return self.sim_display_force_matrix
 
     def _widget_exists(self, widget):
         """Return True only if a Tk/CustomTkinter widget still exists."""
@@ -1301,8 +1343,7 @@ class TactileVisualiserApp(ctk.CTk):
         self.recording.append({
             "t": t,
             "force": self._active_force_matrix().copy(),
-            "raw": self.raw_matrix.copy(),
-            "norm": self.normalised_matrix.copy(),
+            "voltage": self.voltage_matrix.copy(),
         })
         self.record_time_text.set(self._format_time(t))
 
@@ -1337,10 +1378,9 @@ class TactileVisualiserApp(ctk.CTk):
         if self.recording_source == "Live Sensor":
             self.live_force_matrix = frame["force"].copy()
         else:
-            self.sim_force_matrix = frame["force"].copy()
+            self.sim_display_force_matrix = frame["force"].copy()
 
-        self.raw_matrix = frame["raw"].copy()
-        self.normalised_matrix = frame["norm"].copy()
+        self.voltage_matrix = frame["voltage"].copy()
 
         if self._widget_exists(getattr(self, "timeline", None)):
             self.timeline.set(index)
@@ -1393,16 +1433,14 @@ class TactileVisualiserApp(ctk.CTk):
                 "source",
                 "row",
                 "column",
-                "force_N",
-                "raw_value",
-                "normalised_value"
+                "voltage_V",
+                "force_N"
             ])
 
             for frame in self.recording:
                 t = float(frame["t"])
                 force = frame["force"]
-                raw = frame["raw"]
-                norm = frame["norm"]
+                voltage = frame["voltage"]
 
                 for r in range(self.rows):
                     for c in range(self.cols):
@@ -1411,9 +1449,8 @@ class TactileVisualiserApp(ctk.CTk):
                             self.recording_source,
                             r + 1,
                             c + 1,
-                            f"{float(force[r, c]):.3f}",
-                            f"{float(raw[r, c]):.3f}",
-                            f"{float(norm[r, c]):.6f}"
+                            f"{float(voltage[r, c]):.4f}",
+                            f"{float(force[r, c]):.3f}"
                         ])
 
         messagebox.showinfo(
@@ -1424,34 +1461,29 @@ class TactileVisualiserApp(ctk.CTk):
     # =========================================================
     # SIMULATION
     # =========================================================
-    def _generate_raw_matrix(self):
-        # Live Sensor mode intentionally does not accept simulated edits.
-        # Until the real streaming protocol exists, it displays zeros when
-        # no sensor is connected, preserving a clean separation from simulation.
-        if self.data_source.get() == "Live Sensor":
-            if not self.live_sensor_connected:
-                self.live_force_matrix.fill(0.0)
-                return np.zeros((self.rows, self.cols), dtype=float)
+    def _generate_simulated_force_matrix(self):
+        """
+        Build the displayed force field from positive epicentral simulation inputs.
 
-            # Placeholder for future hardware streaming:
-            # self.live_force_matrix should be populated directly from the
-            # interface/DAQ in newtons.
-            return np.clip(
-                (self.live_force_matrix / SATURATION_FORCE_N) * 1000.0,
-                0.0,
-                1000.0
-            )
-
+        Only taxels that have a direct simulated input in sim_force_matrix act as
+        pressure epicentres. Each epicentre spreads into neighbouring taxels using
+        the same Gaussian footprint. Surrounding taxels are display-only unless the
+        user scrolls up on them to create a new epicentre.
+        """
         yy, xx = np.mgrid[0:self.rows, 0:self.cols]
         result = np.zeros((self.rows, self.cols), dtype=float)
 
-        active = np.argwhere(self.sim_force_matrix > 0)
+        active = np.argwhere(self.sim_force_matrix > 0.0)
 
         for r, c in active:
-            force_n = float(self.sim_force_matrix[r, c])
-            force_ratio = np.clip(force_n / SIM_MAX_FORCE_N, 0.0, 1.0)
+            source_force = float(self.sim_force_matrix[r, c])
+            force_ratio = np.clip(
+                source_force / SIM_MAX_FORCE_N,
+                0.0,
+                1.0
+            )
 
-            # Higher force gives a slightly wider contact footprint.
+            # Higher force creates a slightly wider contact footprint.
             spread = 1.0 + 4.0 * force_ratio
 
             gaussian = np.exp(
@@ -1461,19 +1493,29 @@ class TactileVisualiserApp(ctk.CTk):
                 ) / spread
             )
 
-            peak_raw = 1000.0 * force_ratio
-            result += gaussian * peak_raw
+            result += gaussian * source_force
 
-        return np.clip(result, 0.0, 1000.0)
+        return np.clip(result, 0.0, SIM_MAX_FORCE_N)
 
-    def _calculate_normalised_matrix(self):
-        corrected = np.clip(self.raw_matrix - self.baseline, 0.0, None)
+    def _generate_voltage_matrix(self):
+        if self.data_source.get() == "Live Sensor":
+            if not self.live_sensor_connected:
+                self.live_force_matrix.fill(0.0)
+                return np.zeros((self.rows, self.cols), dtype=float)
 
-        max_val = np.max(corrected)
-        if max_val <= 0:
-            return np.zeros_like(corrected)
+            # Placeholder until the Interface/DAQ supplies actual voltage.
+            return np.clip(
+                (self.live_force_matrix / SATURATION_FORCE_N) * MAX_VOLTAGE_V,
+                0.0,
+                MAX_VOLTAGE_V
+            )
 
-        return corrected / max_val
+        # Voltage is derived from the exact same spread force field.
+        return np.clip(
+            (self.sim_display_force_matrix / SIM_MAX_FORCE_N) * MAX_VOLTAGE_V,
+            0.0,
+            MAX_VOLTAGE_V
+        )
 
     # =========================================================
     # GRAPH
@@ -1487,7 +1529,7 @@ class TactileVisualiserApp(ctk.CTk):
         self.live_history.append({
             "t": now,
             "force": self._active_force_matrix().copy(),
-            "norm": self.normalised_matrix.copy(),
+            "voltage": self.voltage_matrix.copy(),
         })
 
         cutoff = now - self.history_window_seconds
@@ -1716,10 +1758,10 @@ class TactileVisualiserApp(ctk.CTk):
         cell_w = draw_w / self.cols
         cell_h = draw_h / self.rows
 
-        if self.display_mode.get() == "raw":
-            scaled = np.clip(self.raw_matrix / 1000.0, 0.0, 1.0)
+        if self.display_mode.get() == "voltage":
+            scaled = np.clip(self.voltage_matrix / MAX_VOLTAGE_V, 0.0, 1.0)
         else:
-            scaled = np.clip(self.normalised_matrix, 0.0, 1.0)
+            scaled = np.clip(self._active_force_matrix() / SIM_MAX_FORCE_N, 0.0, 1.0)
 
         for r in range(self.rows):
             for c in range(self.cols):
@@ -1727,6 +1769,26 @@ class TactileVisualiserApp(ctk.CTk):
                 idx = int(np.clip(val * 255, 0, 255))
                 b, g, rr = self.viridis_lut[idx]
                 colour = f"#{rr:02x}{g:02x}{b:02x}"
+
+                # In Simulation mode, tint only a true input epicentre orange when
+                # its direct simulated input reaches the maximum value. Neighbouring
+                # taxels that are bright only because of spread are not tinted.
+                max_epicentre = (
+                    self.data_source.get() == "Simulation"
+                    and not self.is_playing
+                    and self.sim_force_matrix[r, c] >= SIM_MAX_FORCE_N - 1e-9
+                )
+
+                if max_epicentre:
+                    # Blend the Viridis colour lightly toward orange (#f59e0b).
+                    orange = (245, 158, 11)
+                    base = (int(rr), int(g), int(b))
+                    blend = 0.35
+                    mixed = tuple(
+                        int((1.0 - blend) * base[i] + blend * orange[i])
+                        for i in range(3)
+                    )
+                    colour = f"#{mixed[0]:02x}{mixed[1]:02x}{mixed[2]:02x}"
 
                 x0 = margin_left + c * cell_w
                 y0 = margin_top + r * cell_h
@@ -1741,6 +1803,9 @@ class TactileVisualiserApp(ctk.CTk):
                     width = 3
                 elif hovered:
                     outline = "#38bdf8"
+                    width = 2
+                elif max_epicentre:
+                    outline = "#f59e0b"
                     width = 2
                 else:
                     outline = "#334155"
@@ -1780,7 +1845,7 @@ class TactileVisualiserApp(ctk.CTk):
     # CALIBRATION / SETTINGS
     # =========================================================
     def _capture_baseline(self):
-        self.baseline = self.raw_matrix.copy()
+        self.baseline = self.voltage_matrix.copy()
         self.baseline_captured = True
         self.calibration_status.set(
             f"Baseline captured for {self.rows} × {self.cols}"
@@ -1838,9 +1903,9 @@ class TactileVisualiserApp(ctk.CTk):
         self.sel_position.set(f"Row {r+1}, Column {c+1}")
         active_force = self._active_force_matrix()
         force_n = float(active_force[r, c])
+        voltage_v = float(self.voltage_matrix[r, c])
+        self.sel_voltage.set(f"{voltage_v:.3f} V")
         self.sel_force.set(f"{force_n:.1f} N")
-        self.sel_raw.set(f"{self.raw_matrix[r, c]:.1f}")
-        self.sel_norm.set(f"{self.normalised_matrix[r, c]:.3f}")
 
     def _update_loop(self):
         now = time.time()
@@ -1858,8 +1923,12 @@ class TactileVisualiserApp(ctk.CTk):
         if self.is_playing:
             self._advance_playback()
         else:
-            self.raw_matrix = self._generate_raw_matrix()
-            self.normalised_matrix = self._calculate_normalised_matrix()
+            if self.data_source.get() == "Simulation":
+                self.sim_display_force_matrix = self._generate_simulated_force_matrix()
+
+            self.voltage_matrix = self._generate_voltage_matrix()
+            if self.baseline_captured:
+                self.voltage_matrix = np.clip(self.voltage_matrix - self.baseline, 0.0, MAX_VOLTAGE_V)
 
             self._update_live_history()
             self._record_current_frame()
