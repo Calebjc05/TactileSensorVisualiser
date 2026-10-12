@@ -45,6 +45,7 @@ class TactileVisualiserApp(ctk.CTk):
         self.live_sensor_connected = False
 
         self.voltage_matrix = np.zeros((self.rows, self.cols), dtype=float)
+        self.resistance_matrix = np.full((self.rows, self.cols), np.nan, dtype=float)
         self.baseline = np.zeros((self.rows, self.cols), dtype=float)
         self.baseline_captured = False
 
@@ -78,6 +79,9 @@ class TactileVisualiserApp(ctk.CTk):
         self.playback_index = 0
         self.playback_last_step = time.time()
         self.playback_speed = 1.0
+        # Keep a recorded frame visible while paused, finished, or scrubbing.
+        # Explicit Stop returns the GUI to the normal live/simulation view.
+        self.playback_view_active = False
 
         self.record_status_text = tk.StringVar(value="Idle")
         self.record_time_text = tk.StringVar(value="00:00.0")
@@ -365,7 +369,7 @@ class TactileVisualiserApp(ctk.CTk):
         # Recording / playback strip
         record_bar = ctk.CTkFrame(heat_card, fg_color=self._palette()["shell"], corner_radius=10)
         record_bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
-        record_bar.grid_columnconfigure(5, weight=1)
+        record_bar.grid_columnconfigure(6, weight=1)
 
         self.record_button = ctk.CTkButton(
             record_bar,
@@ -397,6 +401,16 @@ class TactileVisualiserApp(ctk.CTk):
         )
         self.stop_button.grid(row=0, column=2, padx=6, pady=10)
 
+        self.import_button = ctk.CTkButton(
+            record_bar,
+            text="Import CSV",
+            width=100,
+            command=self._import_recording_csv,
+            fg_color="#475569",
+            hover_color="#334155"
+        )
+        self.import_button.grid(row=0, column=3, padx=6, pady=10)
+
         self.export_button = ctk.CTkButton(
             record_bar,
             text="Export CSV",
@@ -405,13 +419,13 @@ class TactileVisualiserApp(ctk.CTk):
             fg_color="#334155",
             hover_color="#1e293b"
         )
-        self.export_button.grid(row=0, column=3, padx=6, pady=10)
+        self.export_button.grid(row=0, column=4, padx=6, pady=10)
 
         ctk.CTkLabel(
             record_bar,
             textvariable=self.record_time_text,
             font=ctk.CTkFont(size=13, weight="bold")
-        ).grid(row=0, column=4, padx=(10, 6))
+        ).grid(row=0, column=5, padx=(10, 6))
 
         self.timeline = ctk.CTkSlider(
             record_bar,
@@ -421,14 +435,14 @@ class TactileVisualiserApp(ctk.CTk):
             command=self._on_timeline_changed
         )
         self.timeline.set(0)
-        self.timeline.grid(row=0, column=5, sticky="ew", padx=10, pady=10)
+        self.timeline.grid(row=0, column=6, sticky="ew", padx=10, pady=10)
 
         ctk.CTkLabel(
             record_bar,
             textvariable=self.playback_position_text,
             text_color=self._palette()["muted"],
             font=ctk.CTkFont(size=11)
-        ).grid(row=0, column=6, padx=(4, 10))
+        ).grid(row=0, column=7, padx=(4, 10))
 
         # -------------------------
         # Right column
@@ -999,6 +1013,7 @@ class TactileVisualiserApp(ctk.CTk):
         self.sim_display_force_matrix = np.zeros((rows, cols), dtype=float)
         self.live_force_matrix = np.zeros((rows, cols), dtype=float)
         self.voltage_matrix = np.zeros((rows, cols), dtype=float)
+        self.resistance_matrix = np.full((rows, cols), np.nan, dtype=float)
         self.baseline = np.zeros((rows, cols), dtype=float)
 
         self.selected_row = min(self.selected_row, rows - 1)
@@ -1244,6 +1259,7 @@ class TactileVisualiserApp(ctk.CTk):
             self._stop_playback()
 
         if not self.is_recording:
+            self.playback_view_active = False
             self.recording = []
             self.recording_source = self.data_source.get()
             self.record_start_time = time.time()
@@ -1303,6 +1319,7 @@ class TactileVisualiserApp(ctk.CTk):
             self._stop_recording()
 
         if not self.is_playing:
+            self.playback_view_active = True
             self.is_playing = True
             self.is_paused = False
             self.play_button.configure(text="❚❚ Pause", fg_color="#d97706", hover_color="#b45309")
@@ -1320,10 +1337,21 @@ class TactileVisualiserApp(ctk.CTk):
                 self.play_button.configure(text="❚❚ Pause", fg_color="#d97706", hover_color="#b45309")
                 self.playback_last_step = time.time()
 
-    def _stop_playback(self):
+    def _stop_playback(self, preserve_frame=False):
         self.is_playing = False
         self.is_paused = False
-        self.mode_text.set("Simulation")
+
+        if preserve_frame and self.recording:
+            # Keep the current recorded frame on screen so the user can scrub
+            # the timeline after playback reaches the end.
+            self.playback_view_active = True
+            self.mode_text.set("Playback")
+        else:
+            # Explicit Stop leaves playback/scrub mode and returns to the current
+            # Simulation or Live Sensor data source.
+            self.playback_view_active = False
+            self.mode_text.set(self.data_source.get())
+
         if self._widget_exists(getattr(self, "play_button", None)):
             self.play_button.configure(
                 text="▶ Play",
@@ -1333,7 +1361,7 @@ class TactileVisualiserApp(ctk.CTk):
 
     def _stop_recording_playback(self):
         self._stop_recording()
-        self._stop_playback()
+        self._stop_playback(preserve_frame=False)
 
     def _record_current_frame(self):
         if not self.is_recording:
@@ -1344,6 +1372,9 @@ class TactileVisualiserApp(ctk.CTk):
             "t": t,
             "force": self._active_force_matrix().copy(),
             "voltage": self.voltage_matrix.copy(),
+            "resistance": self._calculate_resistance_matrix(
+                self.voltage_matrix
+            ).copy(),
         })
         self.record_time_text.set(self._format_time(t))
 
@@ -1362,7 +1393,8 @@ class TactileVisualiserApp(ctk.CTk):
         self.playback_index += 1
         if self.playback_index >= len(self.recording):
             self.playback_index = len(self.recording) - 1
-            self._stop_playback()
+            self._apply_recorded_frame(self.playback_index)
+            self._stop_playback(preserve_frame=True)
             return
 
         self._apply_recorded_frame(self.playback_index)
@@ -1372,6 +1404,7 @@ class TactileVisualiserApp(ctk.CTk):
             return
 
         index = int(np.clip(index, 0, len(self.recording) - 1))
+        self.playback_view_active = True
         self.playback_index = index
         frame = self.recording[index]
 
@@ -1381,6 +1414,10 @@ class TactileVisualiserApp(ctk.CTk):
             self.sim_display_force_matrix = frame["force"].copy()
 
         self.voltage_matrix = frame["voltage"].copy()
+        self.resistance_matrix = frame.get(
+            "resistance",
+            self._calculate_resistance_matrix(self.voltage_matrix)
+        ).copy()
 
         if self._widget_exists(getattr(self, "timeline", None)):
             self.timeline.set(index)
@@ -1393,14 +1430,265 @@ class TactileVisualiserApp(ctk.CTk):
     def _on_timeline_changed(self, value):
         if not self.recording:
             return
+
+        # Timeline movement is a playback-view action even if playback has
+        # finished. Hold the selected recorded frame instead of allowing the
+        # normal simulation/live update loop to overwrite it immediately.
+        self.playback_view_active = True
+        self.mode_text.set("Playback")
+
         index = int(round(float(value)))
         self._apply_recorded_frame(index)
+
+        # Redraw immediately so active taxels follow the slider while dragging.
+        if self.current_page == "live":
+            self._update_selected_taxel_info()
+            self._draw_heatmap()
+            self._draw_history_graph()
 
     @staticmethod
     def _format_time(seconds):
         mins = int(seconds // 60)
         secs = seconds % 60
         return f"{mins:02d}:{secs:04.1f}"
+
+    def _import_recording_csv(self):
+        """
+        Import a previously exported tactile recording CSV and rebuild the
+        in-memory frame sequence used by the existing playback controls.
+
+        Expected columns:
+            timestamp_s,row,column,voltage_V,resistance_ohm,force_N
+
+        Rows and columns are 1-based in the CSV. The grid dimensions are inferred
+        from the largest row and column values in the file.
+        """
+        if self.is_recording:
+            messagebox.showinfo(
+                "Import CSV",
+                "Stop the current recording before importing a CSV."
+            )
+            return
+
+        path = filedialog.askopenfilename(
+            title="Import Tactile Recording CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        required_columns = [
+            "timestamp_s",
+            "row",
+            "column",
+            "voltage_V",
+            "resistance_ohm",
+            "force_N",
+        ]
+
+        try:
+            with open(path, "r", newline="") as csvfile:
+                reader = csv.DictReader(csvfile)
+
+                if reader.fieldnames is None:
+                    raise ValueError("The CSV does not contain a header row.")
+
+                missing = [
+                    name for name in required_columns
+                    if name not in reader.fieldnames
+                ]
+                if missing:
+                    raise ValueError(
+                        "Missing required column(s): " + ", ".join(missing)
+                    )
+
+                parsed_rows = []
+                max_row = 0
+                max_col = 0
+
+                for line_number, item in enumerate(reader, start=2):
+                    try:
+                        timestamp = float(item["timestamp_s"])
+                        row = int(item["row"])
+                        col = int(item["column"])
+                        voltage = float(item["voltage_V"])
+                        force = float(item["force_N"])
+
+                        resistance_text = (item["resistance_ohm"] or "").strip()
+                        resistance = (
+                            float(resistance_text)
+                            if resistance_text
+                            else np.nan
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Invalid numeric value on CSV line {line_number}."
+                        ) from exc
+
+                    if timestamp < 0:
+                        raise ValueError(
+                            f"Negative timestamp on CSV line {line_number}."
+                        )
+                    if row < 1 or col < 1:
+                        raise ValueError(
+                            f"Row and column must be 1 or greater "
+                            f"(CSV line {line_number})."
+                        )
+                    if not (0.0 <= voltage <= MAX_VOLTAGE_V + 1e-9):
+                        raise ValueError(
+                            f"Voltage outside 0–{MAX_VOLTAGE_V:g} V "
+                            f"on CSV line {line_number}."
+                        )
+                    if force < 0:
+                        raise ValueError(
+                            f"Negative force on CSV line {line_number}."
+                        )
+
+                    parsed_rows.append(
+                        (timestamp, row, col, voltage, resistance, force)
+                    )
+                    max_row = max(max_row, row)
+                    max_col = max(max_col, col)
+
+        except (OSError, csv.Error, ValueError) as exc:
+            messagebox.showerror(
+                "Import Failed",
+                f"Could not import the recording:\n\n{exc}"
+            )
+            return
+
+        if not parsed_rows:
+            messagebox.showerror(
+                "Import Failed",
+                "The CSV contains no recording data."
+            )
+            return
+
+        if max_row > MAX_ROWS or max_col > MAX_COLS:
+            messagebox.showerror(
+                "Import Failed",
+                f"The recording uses a {max_row} × {max_col} grid, "
+                f"but the GUI supports a maximum of "
+                f"{MAX_ROWS} × {MAX_COLS}."
+            )
+            return
+
+        # Group every taxel row by timestamp so each timestamp becomes one frame.
+        grouped = {}
+        for timestamp, row, col, voltage, resistance, force in parsed_rows:
+            grouped.setdefault(timestamp, []).append(
+                (row, col, voltage, resistance, force)
+            )
+
+        expected_taxels = max_row * max_col
+        imported_recording = []
+
+        try:
+            for timestamp in sorted(grouped):
+                entries = grouped[timestamp]
+
+                if len(entries) != expected_taxels:
+                    raise ValueError(
+                        f"Timestamp {timestamp:.3f} s contains "
+                        f"{len(entries)} taxels; expected {expected_taxels} "
+                        f"for a {max_row} × {max_col} grid."
+                    )
+
+                voltage_matrix = np.zeros((max_row, max_col), dtype=float)
+                resistance_matrix = np.full(
+                    (max_row, max_col),
+                    np.nan,
+                    dtype=float
+                )
+                force_matrix = np.zeros((max_row, max_col), dtype=float)
+
+                seen = set()
+
+                for row, col, voltage, resistance, force in entries:
+                    key = (row, col)
+                    if key in seen:
+                        raise ValueError(
+                            f"Duplicate taxel R{row}, C{col} at "
+                            f"{timestamp:.3f} s."
+                        )
+                    seen.add(key)
+
+                    r = row - 1
+                    c = col - 1
+                    voltage_matrix[r, c] = voltage
+                    resistance_matrix[r, c] = resistance
+                    force_matrix[r, c] = force
+
+                if len(seen) != expected_taxels:
+                    raise ValueError(
+                        f"Timestamp {timestamp:.3f} s does not contain "
+                        "a complete grid."
+                    )
+
+                imported_recording.append({
+                    "t": float(timestamp),
+                    "voltage": voltage_matrix,
+                    "resistance": resistance_matrix,
+                    "force": force_matrix,
+                })
+
+        except ValueError as exc:
+            messagebox.showerror(
+                "Import Failed",
+                f"Could not reconstruct the recording:\n\n{exc}"
+            )
+            return
+
+        # Stop any current playback, resize to the imported grid, then install
+        # the reconstructed recording.
+        self._stop_recording_playback()
+        self._set_grid_size(max_row, max_col)
+
+        self.recording = imported_recording
+        self.recording_source = "Imported CSV"
+        self.playback_index = 0
+        self.playback_view_active = True
+
+        self.timeline.configure(
+            from_=0,
+            to=max(len(self.recording) - 1, 1),
+            number_of_steps=max(len(self.recording) - 1, 1)
+        )
+        self.timeline.set(0)
+
+        self._apply_recorded_frame(0)
+
+        duration = self.recording[-1]["t"]
+        self.playback_position_text.set(
+            f"Imported • {len(self.recording)} frames • {duration:.1f} s"
+        )
+        self.mode_text.set("Imported CSV")
+        self.connection_text.set("CSV loaded")
+
+        self._update_selected_taxel_info()
+        self._draw_heatmap()
+        self._draw_history_graph()
+
+        messagebox.showinfo(
+            "Import Complete",
+            f"Recording imported successfully.\n\n"
+            f"Grid: {max_row} × {max_col}\n"
+            f"Frames: {len(self.recording)}\n"
+            f"Duration: {duration:.3f} s"
+        )
+
+    def _calculate_resistance_matrix(self, voltage_matrix):
+        """
+        Convert taxel voltage values to resistance in ohms.
+
+        The electrical team's voltage-divider / sensing equation has not yet
+        been confirmed, so resistance is intentionally left as NaN for now.
+
+        Once the circuit details are known, only this method needs to be
+        updated. It should return a NumPy matrix with the same shape as
+        voltage_matrix, containing resistance values in ohms.
+        """
+        return np.full_like(voltage_matrix, np.nan, dtype=float)
 
     def _export_full_recording_csv(self):
         if self.is_recording:
@@ -1429,11 +1717,11 @@ class TactileVisualiserApp(ctk.CTk):
         with open(path, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow([
-                "time_s",
-                "source",
+                "timestamp_s",
                 "row",
                 "column",
                 "voltage_V",
+                "resistance_ohm",
                 "force_N"
             ])
 
@@ -1441,15 +1729,26 @@ class TactileVisualiserApp(ctk.CTk):
                 t = float(frame["t"])
                 force = frame["force"]
                 voltage = frame["voltage"]
+                resistance = frame.get(
+                    "resistance",
+                    self._calculate_resistance_matrix(voltage)
+                )
 
                 for r in range(self.rows):
                     for c in range(self.cols):
+                        resistance_value = float(resistance[r, c])
+                        resistance_csv = (
+                            ""
+                            if np.isnan(resistance_value)
+                            else f"{resistance_value:.3f}"
+                        )
+
                         writer.writerow([
                             f"{t:.3f}",
-                            self.recording_source,
                             r + 1,
                             c + 1,
                             f"{float(voltage[r, c]):.4f}",
+                            resistance_csv,
                             f"{float(force[r, c]):.3f}"
                         ])
 
@@ -1922,6 +2221,11 @@ class TactileVisualiserApp(ctk.CTk):
 
         if self.is_playing:
             self._advance_playback()
+        elif self.playback_view_active:
+            # Hold the currently selected recorded frame. This is what allows
+            # timeline scrubbing after playback finishes without the frame being
+            # overwritten by fresh simulation/live values on the next 33 ms tick.
+            pass
         else:
             if self.data_source.get() == "Simulation":
                 self.sim_display_force_matrix = self._generate_simulated_force_matrix()
