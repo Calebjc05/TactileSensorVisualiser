@@ -17,6 +17,12 @@ SIM_MAX_FORCE_N = 40.0
 MAX_VOLTAGE_V = 2.6
 SATURATION_FORCE_N = 40.0
 
+# ZPC transimpedance front-end values.
+# Update these constants if the feedback resistor or Vref network changes
+# for a different tactile fabric.
+VREF_V = 1.65
+FEEDBACK_RESISTOR_OHM = 1_000_000.0
+
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
@@ -1679,16 +1685,40 @@ class TactileVisualiserApp(ctk.CTk):
 
     def _calculate_resistance_matrix(self, voltage_matrix):
         """
-        Convert taxel voltage values to resistance in ohms.
+        Calculate tactile-sensor resistance from the ZPC transimpedance front-end.
 
-        The electrical team's voltage-divider / sensing equation has not yet
-        been confirmed, so resistance is intentionally left as NaN for now.
+        Electrical-team relationship:
+            Rsensor = Rf * Vref / (Vout - Vref)
 
-        Once the circuit details are known, only this method needs to be
-        updated. It should return a NumPy matrix with the same shape as
-        voltage_matrix, containing resistance values in ohms.
+        where:
+            Vref = 1.65 V
+            Rf   = 1 MOhm
+            Vout = ADC voltage for the taxel
+
+        For Vout <= Vref, the reading is treated as open/noise rather than
+        attempting to calculate a resistance. Those values are stored as NaN
+        internally and exported as a blank resistance cell in the CSV.
+
+        If the circuit is changed for another fabric, update VREF_V and
+        FEEDBACK_RESISTOR_OHM near the top of this file.
         """
-        return np.full_like(voltage_matrix, np.nan, dtype=float)
+        voltage = np.asarray(voltage_matrix, dtype=float)
+
+        resistance = np.full_like(
+            voltage,
+            np.nan,
+            dtype=float
+        )
+
+        valid = voltage > VREF_V
+
+        resistance[valid] = (
+            FEEDBACK_RESISTOR_OHM
+            * VREF_V
+            / (voltage[valid] - VREF_V)
+        )
+
+        return resistance
 
     def _export_full_recording_csv(self):
         if self.is_recording:
