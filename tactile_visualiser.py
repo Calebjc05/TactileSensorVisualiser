@@ -23,6 +23,21 @@ SATURATION_FORCE_N = 40.0
 VREF_V = 1.65
 FEEDBACK_RESISTOR_OHM = 1_000_000.0
 
+# =========================================================
+# LIVE INPUT INTEGRATION TEST
+# =========================================================
+# This build opens directly in Live Sensor mode and drives known voltage
+# matrices through the same live-voltage buffer that the future Interface/DAQ
+# will populate. Each pattern is held long enough to record clear evidence.
+LIVE_INPUT_TEST_ENABLED = True
+LIVE_TEST_PHASE_SECONDS = 3.0
+
+# Provisional GUI test mapping only:
+# maps 0..MAX_VOLTAGE_V linearly to 0..SATURATION_FORCE_N.
+# Replace this with the calibrated sensor Force = f(Voltage/Resistance)
+# relationship once physical calibration data is available.
+LIVE_TEST_FORCE_SCALE_N = SATURATION_FORCE_N
+
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
@@ -47,8 +62,14 @@ class TactileVisualiserApp(ctk.CTk):
         self.sim_display_force_matrix = np.zeros((self.rows, self.cols), dtype=float)  # spread/combined force field
         self.live_force_matrix = np.zeros((self.rows, self.cols), dtype=float)
 
-        self.data_source = tk.StringVar(value="Simulation")
-        self.live_sensor_connected = False
+        # Raw live voltage buffer. In the finished system, the Interface/DAQ layer
+        # can write measured ADC voltages into this matrix.
+        self.live_voltage_matrix = np.zeros((self.rows, self.cols), dtype=float)
+
+        self.data_source = tk.StringVar(
+            value="Live Sensor" if LIVE_INPUT_TEST_ENABLED else "Simulation"
+        )
+        self.live_sensor_connected = bool(LIVE_INPUT_TEST_ENABLED)
 
         self.voltage_matrix = np.zeros((self.rows, self.cols), dtype=float)
         self.resistance_matrix = np.full((self.rows, self.cols), np.nan, dtype=float)
@@ -61,14 +82,25 @@ class TactileVisualiserApp(ctk.CTk):
         self.hover_col = None
 
         self.display_mode = tk.StringVar(value="voltage")
-        self.mode_text = tk.StringVar(value="Simulation")
-        self.connection_text = tk.StringVar(value="No hardware")
+        self.mode_text = tk.StringVar(
+            value="Live Sensor" if LIVE_INPUT_TEST_ENABLED else "Simulation"
+        )
+        self.connection_text = tk.StringVar(
+            value="Connected: Interface Input" if LIVE_INPUT_TEST_ENABLED else "No hardware"
+        )
         self.fps_text = tk.StringVar(value="0.0 FPS")
         self.grid_text = tk.StringVar(value=f"{self.rows} × {self.cols}")
         self.appearance_mode = tk.StringVar(value="Light")
         self._apply_root_colours()
-        self.hardware_detect_text = tk.StringVar(value="No hardware detected")
-        self.detected_port = None
+        self.hardware_detect_text = tk.StringVar(
+            value="Interface input active" if LIVE_INPUT_TEST_ENABLED else "No hardware detected"
+        )
+        self.detected_port = "Interface Input" if LIVE_INPUT_TEST_ENABLED else None
+
+        # Test pattern timing. Pattern changes are deterministic and repeat every
+        # four phases so a screen recording can capture several live conditions.
+        self.live_test_start_time = time.time()
+        self.live_test_phase = -1
 
         self.last_frame_time = time.time()
         self.fps_smoothed = 0.0
@@ -312,7 +344,7 @@ class TactileVisualiserApp(ctk.CTk):
         ).grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(
-            title_row, text="SIMULATION",
+            title_row, text="LIVE INPUT" if LIVE_INPUT_TEST_ENABLED else "SIMULATION",
             fg_color="#dbeafe", text_color="#1d4ed8",
             corner_radius=8, padx=10, pady=4,
             font=ctk.CTkFont(size=11, weight="bold")
@@ -1018,6 +1050,7 @@ class TactileVisualiserApp(ctk.CTk):
         self.sim_force_matrix = np.zeros((rows, cols), dtype=float)
         self.sim_display_force_matrix = np.zeros((rows, cols), dtype=float)
         self.live_force_matrix = np.zeros((rows, cols), dtype=float)
+        self.live_voltage_matrix = np.zeros((rows, cols), dtype=float)
         self.voltage_matrix = np.zeros((rows, cols), dtype=float)
         self.resistance_matrix = np.full((rows, cols), np.nan, dtype=float)
         self.baseline = np.zeros((rows, cols), dtype=float)
@@ -1074,6 +1107,14 @@ class TactileVisualiserApp(ctk.CTk):
             self.connection_text.set("Simulation")
         else:
             self.mode_text.set("Live Sensor")
+
+            if LIVE_INPUT_TEST_ENABLED:
+                self.live_sensor_connected = True
+                self.detected_port = "Interface Input"
+                self.live_test_start_time = time.time()
+                self.live_test_phase = -1
+                self._update_live_input_test_data()
+
             if self.live_sensor_connected:
                 self.connection_text.set(
                     f"Connected: {self.detected_port}"
@@ -1826,20 +1867,116 @@ class TactileVisualiserApp(ctk.CTk):
 
         return np.clip(result, 0.0, SIM_MAX_FORCE_N)
 
+    def _update_live_input_test_data(self):
+        """
+        Feed known voltage matrices into the live-data buffer.
+
+        This exercises the Live Sensor processing/display/recording path without
+        changing the downstream GUI logic. The future Interface/DAQ can replace
+        this producer and write measured ADC voltages to live_voltage_matrix.
+        """
+        if not LIVE_INPUT_TEST_ENABLED:
+            return
+
+        if self.data_source.get() != "Live Sensor":
+            return
+
+        self.live_sensor_connected = True
+        self.detected_port = "Interface Input"
+
+        elapsed = time.time() - self.live_test_start_time
+        phase = int(elapsed // LIVE_TEST_PHASE_SECONDS) % 4
+
+        # Only rebuild the matrix when the test condition changes.
+        if phase == self.live_test_phase:
+            return
+
+        self.live_test_phase = phase
+        self.live_voltage_matrix.fill(0.0)
+        self.live_force_matrix.fill(0.0)
+
+        def set_v(row, col, voltage):
+            if 1 <= row <= self.rows and 1 <= col <= self.cols:
+                self.live_voltage_matrix[row - 1, col - 1] = float(voltage)
+
+
+        #===========================================================================================
+        #===========================================================================================
+
+        if phase == 0:
+            # Run 1: one central taxel.
+            set_v(8, 8, 2.60)
+            label = "Live condition 1/4"
+
+        elif phase == 1:
+            # Run 2: four adjacent taxels with different magnitudes.
+            set_v(8, 8, 1.80)
+            set_v(8, 9, 2.00)
+            set_v(9, 8, 2.30)
+            set_v(9, 9, 2.60)
+            label = "Live condition 2/4"                                                # Simulated voltage readings are passed into the
+                                                                                        # live sensor input of the GUI inorder to test display
+        elif phase == 2:                                                                # and accuracy on data visable on screen to the user
+            # Run 3: spatially separated edge/corner locations.
+            set_v(2, 2, 1.75)
+            set_v(2, 15, 1.90)
+            set_v(15, 2, 2.20)
+            set_v(15, 15, 2.50)
+            label = "Live condition 3/4"
+
+        else:
+            # Run 4: distributed multi-taxel pattern.
+            set_v(4, 5, 1.70)
+            set_v(6, 12, 1.85)
+            set_v(8, 8, 2.00)
+            set_v(10, 10, 2.20)
+            set_v(12, 5, 2.40)
+            set_v(14, 13, 2.60)
+            label = "Live condition 4/4"
+
+
+        #===========================================================================================
+        #===========================================================================================    
+
+
+
+
+
+
+        # Provisional force conversion for GUI integration testing only.
+        # 0 V -> 0 N and 2.6 V -> 40 N.
+        self.live_force_matrix = np.clip(
+            (self.live_voltage_matrix / MAX_VOLTAGE_V) * LIVE_TEST_FORCE_SCALE_N,
+            0.0,
+            LIVE_TEST_FORCE_SCALE_N
+        )
+
+        self.connection_text.set(f"Connected: Interface Input • {label}")
+        self.mode_text.set("Live Sensor")
+
     def _generate_voltage_matrix(self):
         if self.data_source.get() == "Live Sensor":
             if not self.live_sensor_connected:
                 self.live_force_matrix.fill(0.0)
+                self.live_voltage_matrix.fill(0.0)
                 return np.zeros((self.rows, self.cols), dtype=float)
 
-            # Placeholder until the Interface/DAQ supplies actual voltage.
+            # Live Sensor mode consumes voltage directly from the live input buffer.
+            # For this integration-test build only, derive a provisional force value
+            # so the Force tab exercises the same live-data pathway.
+            self.live_force_matrix = np.clip(
+                (self.live_voltage_matrix / MAX_VOLTAGE_V) * LIVE_TEST_FORCE_SCALE_N,
+                0.0,
+                LIVE_TEST_FORCE_SCALE_N
+            )
+
             return np.clip(
-                (self.live_force_matrix / SATURATION_FORCE_N) * MAX_VOLTAGE_V,
+                self.live_voltage_matrix,
                 0.0,
                 MAX_VOLTAGE_V
             )
 
-        # Voltage is derived from the exact same spread force field.
+        # Simulation voltage is still derived from the simulated force field.
         return np.clip(
             (self.sim_display_force_matrix / SIM_MAX_FORCE_N) * MAX_VOLTAGE_V,
             0.0,
@@ -2259,6 +2396,8 @@ class TactileVisualiserApp(ctk.CTk):
         else:
             if self.data_source.get() == "Simulation":
                 self.sim_display_force_matrix = self._generate_simulated_force_matrix()
+            elif self.data_source.get() == "Live Sensor":
+                self._update_live_input_test_data()
 
             self.voltage_matrix = self._generate_voltage_matrix()
             if self.baseline_captured:
